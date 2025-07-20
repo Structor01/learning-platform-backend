@@ -8,21 +8,26 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust proxy para rate limiting
+app.set('trust proxy', 1);
+
 // Middleware de segurança
 app.use(helmet());
-
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 100 // máximo 100 requests por IP
-});
-app.use(limiter);
 
 // CORS
 app.use(cors({
   origin: '*',
   credentials: true
 }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100, // máximo 100 requests por IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
 
 // Body parser
 app.use(express.json({ limit: '50mb' }));
