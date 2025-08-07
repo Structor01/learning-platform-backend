@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status VARCHAR(20) DEFAULT 'active', -- active, paused, closed
     applications_count INTEGER DEFAULT 0,
     views_count INTEGER DEFAULT 0,
+    created_via_ai BOOLEAN DEFAULT false,
     created_by INTEGER REFERENCES users(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

@@ -52,6 +52,8 @@ app.use('/api/courses', require('./routes/courses'));
 app.use('/api/videos', require('./routes/videos'));
 app.use('/api/crm', require('./routes/crm'));
 app.use('/api/recruitment', require('./routes/recruitment'));
+app.use('/api/interviews', require('./routes/interviews'));
+app.use('/api/psychological-tests', require('./routes/psychological_tests'));
 
 // Middleware de erro
 app.use((err, req, res, next) => {

@@ -329,6 +329,325 @@ router.get('/analytics', auth, async (req, res) => {
   }
 });
 
+// POST /api/recruitment/jobs/generate-with-ai - Gerar vaga com IA
+router.post('/jobs/generate-with-ai', auth, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    
+    if (!prompt || prompt.trim().length === 0) {
+      return res.status(400).json({ error: 'Prompt é obrigatório' });
+    }
+    
+    console.log('🤖 Gerando vaga com IA para prompt:', prompt);
+    
+    // Gerar vaga com ChatGPT
+    const jobData = await generateJobWithAI(prompt);
+    
+    // Salvar vaga no banco
+    const query = `
+      INSERT INTO jobs (
+        title, company, location, job_type, experience_level,
+        salary_range, description, requirements, benefits,
+        skills_required, created_by, status, created_via_ai
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', true)
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, [
+      jobData.title,
+      jobData.company,
+      jobData.location,
+      jobData.job_type,
+      jobData.experience_level,
+      jobData.salary_range,
+      jobData.description,
+      jobData.requirements,
+      jobData.benefits,
+      JSON.stringify(jobData.skills_required),
+      req.user.id
+    ]);
+    
+    const createdJob = result.rows[0];
+    
+    // Criar perguntas customizadas se fornecidas
+    if (jobData.custom_questions && jobData.custom_questions.length > 0) {
+      for (let i = 0; i < jobData.custom_questions.length; i++) {
+        await pool.query(`
+          INSERT INTO job_interview_questions (job_id, question_number, question_text, created_by)
+          VALUES ($1, $2, $3, $4)
+        `, [createdJob.id, i + 1, jobData.custom_questions[i], req.user.id]);
+      }
+    }
+    
+    res.status(201).json({
+      job: createdJob,
+      ai_generated: true,
+      custom_questions: jobData.custom_questions || [],
+      prompt_used: prompt
+    });
+  } catch (error) {
+    console.error('Erro ao gerar vaga com IA:', error);
+    res.status(500).json({ 
+      error: 'Erro ao gerar vaga com IA',
+      fallback_available: true
+    });
+  }
+});
+
+// POST /api/recruitment/jobs/:id/suggest-improvements - Sugerir melhorias na vaga
+router.post('/jobs/:id/suggest-improvements', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Buscar vaga atual
+    const jobQuery = `
+      SELECT * FROM jobs WHERE id = $1
+    `;
+    const jobResult = await pool.query(jobQuery, [id]);
+    
+    if (jobResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Vaga não encontrada' });
+    }
+    
+    const job = jobResult.rows[0];
+    
+    // Gerar sugestões com IA
+    const suggestions = await generateJobImprovements(job);
+    
+    res.json({
+      job_id: id,
+      current_job: job,
+      suggestions: suggestions,
+      generated_at: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Erro ao gerar sugestões:', error);
+    res.status(500).json({ error: 'Erro ao gerar sugestões' });
+  }
+});
+
+// GET /api/recruitment/jobs/:id/questions - Obter perguntas da vaga
+router.get('/jobs/:id/questions', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Buscar perguntas específicas da vaga
+    const customQuery = `
+      SELECT * FROM job_interview_questions 
+      WHERE job_id = $1 
+      ORDER BY question_number
+    `;
+    
+    // Buscar perguntas padrão
+    const defaultQuery = `
+      SELECT * FROM job_interview_questions 
+      WHERE job_id IS NULL AND is_default = true
+      ORDER BY question_number
+    `;
+    
+    const [customResult, defaultResult] = await Promise.all([
+      pool.query(customQuery, [id]),
+      pool.query(defaultQuery)
+    ]);
+    
+    const questions = customResult.rows.length > 0 ? customResult.rows : defaultResult.rows;
+    
+    res.json({
+      job_id: id,
+      questions: questions,
+      is_custom: customResult.rows.length > 0
+    });
+  } catch (error) {
+    console.error('Erro ao buscar perguntas:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// Função para gerar vaga com IA (ChatGPT)
+async function generateJobWithAI(prompt) {
+  try {
+    // Verificar se tem API key do OpenAI
+    if (!process.env.OPENAI_API_KEY) {
+      console.log('⚠️ OPENAI_API_KEY não configurada, usando fallback');
+      return generateJobFallback(prompt);
+    }
+    
+    const systemPrompt = `Você é um especialista em recrutamento e RH. Baseado no prompt do usuário, gere uma vaga de emprego completa e profissional.
+
+Retorne APENAS um JSON válido com esta estrutura:
+{
+  "title": "Título da vaga",
+  "company": "Nome da empresa (se não especificado, use 'Empresa Confidencial')",
+  "location": "Localização (se não especificado, use 'São Paulo, SP')",
+  "job_type": "full-time|part-time|contract|internship",
+  "experience_level": "entry|mid|senior|executive",
+  "salary_range": "Faixa salarial em R$",
+  "description": "Descrição detalhada da vaga (2-3 parágrafos)",
+  "requirements": "Requisitos necessários (lista em texto)",
+  "benefits": "Benefícios oferecidos (lista em texto)",
+  "skills_required": ["skill1", "skill2", "skill3"],
+  "custom_questions": ["Pergunta 1", "Pergunta 2", "Pergunta 3"]
+}
+
+Regras:
+- Seja específico e profissional
+- Use valores de salário realistas para o mercado brasileiro
+- Inclua 3-5 skills relevantes
+- Crie 3 perguntas específicas para a vaga
+- Se o prompt mencionar tecnologias, inclua-as nos requisitos e skills`;
+
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt }
+      ],
+      max_tokens: 1500,
+      temperature: 0.7
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const content = response.data.choices[0].message.content.trim();
+    
+    // Tentar fazer parse do JSON
+    try {
+      const jobData = JSON.parse(content);
+      console.log('✅ Vaga gerada com ChatGPT:', jobData.title);
+      return jobData;
+    } catch (parseError) {
+      console.log('⚠️ Erro no parse do JSON do ChatGPT, usando fallback');
+      return generateJobFallback(prompt);
+    }
+  } catch (error) {
+    console.log('⚠️ Erro na API do ChatGPT, usando fallback:', error.message);
+    return generateJobFallback(prompt);
+  }
+}
+
+// Função de fallback para gerar vaga sem IA
+function generateJobFallback(prompt) {
+  // Extrair informações básicas do prompt
+  const lowerPrompt = prompt.toLowerCase();
+  
+  // Detectar tecnologias/skills
+  const techKeywords = ['python', 'javascript', 'react', 'node', 'java', 'php', 'sql', 'aws', 'docker'];
+  const detectedTechs = techKeywords.filter(tech => lowerPrompt.includes(tech));
+  
+  // Detectar nível
+  let experienceLevel = 'mid';
+  if (lowerPrompt.includes('junior') || lowerPrompt.includes('entry')) experienceLevel = 'entry';
+  if (lowerPrompt.includes('senior') || lowerPrompt.includes('sênior')) experienceLevel = 'senior';
+  if (lowerPrompt.includes('lead') || lowerPrompt.includes('manager')) experienceLevel = 'executive';
+  
+  // Detectar área
+  let area = 'Tecnologia';
+  if (lowerPrompt.includes('vendas') || lowerPrompt.includes('comercial')) area = 'Vendas';
+  if (lowerPrompt.includes('marketing')) area = 'Marketing';
+  if (lowerPrompt.includes('rh') || lowerPrompt.includes('recursos humanos')) area = 'Recursos Humanos';
+  
+  const salaryRanges = {
+    entry: 'R$ 3.000 - R$ 5.000',
+    mid: 'R$ 5.000 - R$ 8.000',
+    senior: 'R$ 8.000 - R$ 12.000',
+    executive: 'R$ 12.000 - R$ 20.000'
+  };
+  
+  return {
+    title: `Profissional de ${area} ${experienceLevel === 'senior' ? 'Sênior' : experienceLevel === 'entry' ? 'Júnior' : ''}`,
+    company: 'Empresa Confidencial',
+    location: 'São Paulo, SP',
+    job_type: 'full-time',
+    experience_level: experienceLevel,
+    salary_range: salaryRanges[experienceLevel],
+    description: `Estamos buscando um profissional de ${area} para integrar nossa equipe. A pessoa será responsável por contribuir com projetos inovadores e trabalhar em um ambiente colaborativo e dinâmico.`,
+    requirements: `Experiência na área de ${area}, conhecimento em ${detectedTechs.join(', ') || 'ferramentas relevantes'}, boa comunicação e trabalho em equipe.`,
+    benefits: 'Plano de saúde, vale refeição, home office flexível, participação nos lucros.',
+    skills_required: detectedTechs.length > 0 ? detectedTechs : [area, 'Comunicação', 'Trabalho em equipe'],
+    custom_questions: [
+      `Conte sobre sua experiência em ${area}.`,
+      'Como você se mantém atualizado com as tendências da área?',
+      'Descreva um projeto desafiador que você trabalhou.'
+    ]
+  };
+}
+
+// Função para gerar sugestões de melhoria
+async function generateJobImprovements(job) {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return generateImprovementsFallback(job);
+    }
+    
+    const prompt = `Analise esta vaga de emprego e sugira melhorias específicas:
+
+Título: ${job.title}
+Empresa: ${job.company}
+Descrição: ${job.description}
+Requisitos: ${job.requirements}
+Benefícios: ${job.benefits}
+
+Retorne um JSON com sugestões de melhoria:
+{
+  "title_suggestions": ["sugestão 1", "sugestão 2"],
+  "description_improvements": ["melhoria 1", "melhoria 2"],
+  "requirements_suggestions": ["sugestão 1", "sugestão 2"],
+  "benefits_additions": ["benefício 1", "benefício 2"],
+  "overall_score": 8.5,
+  "main_issues": ["problema 1", "problema 2"]
+}`;
+
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-3.5-turbo',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 800,
+      temperature: 0.7
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const content = response.data.choices[0].message.content.trim();
+    return JSON.parse(content);
+  } catch (error) {
+    console.log('⚠️ Erro ao gerar sugestões, usando fallback');
+    return generateImprovementsFallback(job);
+  }
+}
+
+// Fallback para sugestões de melhoria
+function generateImprovementsFallback(job) {
+  return {
+    title_suggestions: [
+      'Considere ser mais específico sobre o nível de senioridade',
+      'Adicione a área ou departamento no título'
+    ],
+    description_improvements: [
+      'Inclua mais detalhes sobre as responsabilidades diárias',
+      'Mencione oportunidades de crescimento e desenvolvimento'
+    ],
+    requirements_suggestions: [
+      'Separe requisitos obrigatórios dos desejáveis',
+      'Seja mais específico sobre anos de experiência'
+    ],
+    benefits_additions: [
+      'Considere adicionar benefícios de desenvolvimento profissional',
+      'Mencione cultura da empresa e ambiente de trabalho'
+    ],
+    overall_score: 7.5,
+    main_issues: [
+      'Descrição poderia ser mais detalhada',
+      'Benefícios poderiam ser mais atrativos'
+    ]
+  };
+}
+
 // Função para gerar candidatos mock do LinkedIn
 function generateMockLinkedInCandidates(keywords, location, skills) {
   const names = [
